@@ -1,121 +1,438 @@
-const FIGMA_API_URL = "https://api.figma.com/v1";
+const axios = require("axios");
 
-// Simple in-memory cache
-const fileCache = new Map();
+const FIGMA_TOKEN =
+  process.env.FIGMA_TOKEN;
 
-// Cache files for 30 minutes
-const CACHE_DURATION = 30 * 60 * 1000;
+const FIGMA_API =
+  "https://api.figma.com/v1";
 
 
-async function figmaRequest(endpoint) {
+/*
+ * ==========================================================
+ * FILE CACHE
+ * ==========================================================
+ *
+ * Figma files can be very large.
+ *
+ * Instead of requesting the complete file from Figma
+ * every time someone searches, keep it temporarily
+ * in memory.
+ *
+ * Cache duration:
+ * 5 minutes
+ *
+ * This can be changed later.
+ */
 
-  const response = await fetch(
-    `${FIGMA_API_URL}${endpoint}`,
-    {
-      method: "GET",
+const FILE_CACHE_TTL =
+  5 * 60 * 1000;
 
-      headers: {
-        "X-Figma-Token": process.env.FIGMA_TOKEN
-      }
-    }
-  );
+const fileCache =
+  new Map();
 
-  if (!response.ok) {
 
-    const errorText = await response.text();
+/*
+ * ==========================================================
+ * FIGMA REQUEST
+ * ==========================================================
+ */
+
+async function figmaRequest(
+  url,
+  options = {}
+) {
+
+  if (!FIGMA_TOKEN) {
 
     throw new Error(
-      `Figma API error ${response.status}: ${errorText}`
+      "FIGMA_TOKEN is not configured"
     );
+
   }
 
-  return await response.json();
+
+  try {
+
+    const response =
+      await axios({
+
+        url,
+
+        method:
+          options.method || "GET",
+
+        params:
+          options.params,
+
+        headers: {
+
+          "X-Figma-Token":
+            FIGMA_TOKEN,
+
+          "Content-Type":
+            "application/json"
+
+        }
+
+      });
+
+
+    return response.data;
+
+
+  } catch (error) {
+
+    const status =
+      error.response?.status;
+
+    const data =
+      error.response?.data;
+
+
+    /*
+     * Rate limit
+     */
+
+    if (status === 429) {
+
+      throw new Error(
+        "Figma API rate limit exceeded. Please retry shortly."
+      );
+
+    }
+
+
+    /*
+     * Authentication / permissions
+     */
+
+    if (status === 403) {
+
+      throw new Error(
+
+        `Figma authentication/permission error: ${
+          data?.err || "Forbidden"
+        }`
+
+      );
+
+    }
+
+
+    /*
+     * File not found
+     */
+
+    if (status === 404) {
+
+      throw new Error(
+        "Figma file or node not found"
+      );
+
+    }
+
+
+    /*
+     * Other errors
+     */
+
+    throw new Error(
+
+      `Figma API error ${status || ""}: ${
+        data?.err ||
+        error.message
+      }`
+
+    );
+
+  }
+
 }
 
 
-async function getFile(fileKey) {
+/*
+ * ==========================================================
+ * GET FIGMA FILE
+ * ==========================================================
+ *
+ * Downloads the complete Figma document.
+ *
+ * GET /v1/files/:fileKey
+ */
 
-  // Check cache
-  const cached = fileCache.get(fileKey);
+async function getFile(
+  fileKey
+) {
+
+  if (!fileKey) {
+
+    throw new Error(
+      "fileKey is required"
+    );
+
+  }
+
+
+  return await figmaRequest(
+
+    `${FIGMA_API}/files/${fileKey}`
+
+  );
+
+}
+
+
+/*
+ * ==========================================================
+ * GET CACHED FIGMA FILE
+ * ==========================================================
+ *
+ * Used by search-all.
+ *
+ * This prevents repeatedly calling:
+ *
+ * GET /v1/files/:fileKey
+ *
+ * for every search request.
+ */
+
+async function getCachedFile(
+  fileKey
+) {
+
+  if (!fileKey) {
+
+    throw new Error(
+      "fileKey is required"
+    );
+
+  }
+
+
+  const cached =
+    fileCache.get(fileKey);
+
+
+  /*
+   * Check whether cached file
+   * is still valid.
+   */
 
   if (cached) {
 
     const age =
-      Date.now() - cached.timestamp;
+      Date.now() -
+      cached.timestamp;
 
-    if (age < CACHE_DURATION) {
+
+    if (
+      age < FILE_CACHE_TTL
+    ) {
 
       console.log(
         `Using cached Figma file: ${fileKey}`
       );
 
+
       return cached.data;
+
     }
 
-    // Remove expired cache
-    fileCache.delete(fileKey);
+
+    /*
+     * Cache expired.
+     */
+
+    fileCache.delete(
+      fileKey
+    );
+
   }
 
 
+  /*
+   * Fetch fresh file.
+   */
+
   console.log(
-    `Fetching Figma file from API: ${fileKey}`
+    `Fetching Figma file: ${fileKey}`
   );
 
 
-  const data = await figmaRequest(
-    `/files/${fileKey}`
+  const file =
+    await getFile(
+      fileKey
+    );
+
+
+  /*
+   * Store in cache.
+   */
+
+  fileCache.set(
+
+    fileKey,
+
+    {
+
+      data:
+        file,
+
+      timestamp:
+        Date.now()
+
+    }
+
   );
 
 
-  // Store in cache
-  fileCache.set(fileKey, {
+  return file;
 
-    data,
-
-    timestamp: Date.now()
-
-  });
-
-
-  return data;
 }
 
+
+/*
+ * ==========================================================
+ * CLEAR CACHE
+ * ==========================================================
+ *
+ * Useful when you know a Figma file was updated.
+ */
+
+function clearFileCache(
+  fileKey
+) {
+
+  if (fileKey) {
+
+    fileCache.delete(
+      fileKey
+    );
+
+    return;
+
+  }
+
+
+  /*
+   * Clear everything.
+   */
+
+  fileCache.clear();
+
+}
+
+
+/*
+ * ==========================================================
+ * GET RENDERED NODE IMAGE
+ * ==========================================================
+ *
+ * Generates a PNG preview for a specific node.
+ *
+ * GET /v1/images/:fileKey
+ */
 
 async function getNodeImage(
   fileKey,
   nodeId
 ) {
 
-  const encodedNodeId =
-    encodeURIComponent(nodeId);
+  if (!fileKey) {
 
-
-  return await figmaRequest(
-    `/images/${fileKey}?ids=${encodedNodeId}&format=png`
-  );
-}
-
-
-function clearFileCache(fileKey) {
-
-  if (fileKey) {
-
-    fileCache.delete(fileKey);
-
-  } else {
-
-    fileCache.clear();
+    throw new Error(
+      "fileKey is required"
+    );
 
   }
 
+
+  if (!nodeId) {
+
+    throw new Error(
+      "nodeId is required"
+    );
+
+  }
+
+
+  return await figmaRequest(
+
+    `${FIGMA_API}/images/${fileKey}`,
+
+    {
+
+      params: {
+
+        ids:
+          nodeId,
+
+        format:
+          "png",
+
+        scale:
+          1
+
+      }
+
+    }
+
+  );
+
 }
 
+
+/*
+ * ==========================================================
+ * GET CONFIGURED FILE KEYS
+ * ==========================================================
+ *
+ * Reads:
+ *
+ * FIGMA_FILE_KEYS=file1,file2,file3
+ *
+ * from .env
+ *
+ * These are currently your Draft files.
+ */
+
+function getConfiguredFileKeys() {
+
+  const value =
+    process.env.FIGMA_FILE_KEYS || "";
+
+
+  return value
+
+    .split(",")
+
+    .map(
+      key =>
+        key.trim()
+    )
+
+    .filter(
+      Boolean
+    );
+
+}
+
+
+/*
+ * ==========================================================
+ * EXPORTS
+ * ==========================================================
+ */
 
 module.exports = {
 
   getFile,
 
+  getCachedFile,
+
   getNodeImage,
+
+  getConfiguredFileKeys,
 
   clearFileCache
 
